@@ -18,9 +18,25 @@
 import logging
 import platform
 import threading
+import struct
+import socket
+import subprocess
+import sys
+
+try:
+    import fcntl  # type: ignore[attr-defined]
+    import ctypes
+    import ctypes.util
+except Exception:  # pragma: no cover - only present on non-Darwin platforms
+    fcntl = None  # type: ignore[assignment]
+    ctypes = None  # type: ignore[assignment]
 
 from pubsub import pub # type: ignore[import-untyped]
-from pytap2 import TapDevice
+
+try:
+    from pytap2 import TapDevice  # Linux-only dependency
+except Exception:  # pragma: no cover - allow import without pytap2 on macOS
+    TapDevice = None  # type: ignore[assignment]
 
 from meshtastic.protobuf import portnums_pb2
 from meshtastic import mt_config
@@ -64,8 +80,11 @@ class Tunnel:
         self.iface = iface
         self.subnetPrefix = subnet
 
-        if platform.system() != "Linux":
-            raise Tunnel.TunnelError("Tunnel() can only be run instantiated on a Linux system")
+        # Allow Linux and macOS (Darwin). Other platforms remain unsupported.
+        if platform.system() not in ("Linux", "Darwin"):
+            raise Tunnel.TunnelError(
+                "Tunnel() can only be instantiated on Linux or macOS (Darwin)"
+            )
 
         mt_config.tunnelInstance = self
 
@@ -115,9 +134,44 @@ class Tunnel:
                 f"Not creating a TapDevice() because it is disabled by noProto"
             )
         else:
-            self.tun = TapDevice(name="mesh")
-            self.tun.up()
-            self.tun.ifconfig(address=myAddr, netmask=netmask, mtu=200)
+            system = platform.system()
+            if system == "Linux":
+                if TapDevice is None:
+                    raise Tunnel.TunnelError(
+                        "pytap2 is required for Linux TUN/TAP support. Install with the 'tunnel' extra."
+                    )
+                # Try to create a TAP/TUN device. Some platforms may not accept a
+                # custom name; fall back to default naming if needed.
+                try:
+                    self.tun = TapDevice(name="mesh")
+                except Exception as ex:  # pylint: disable=broad-except
+                    logger.warning(
+                        "TapDevice(name='mesh') failed (%s), retrying with default name",
+                        ex,
+                    )
+                    self.tun = TapDevice()
+
+                self.tun.up()
+                self.tun.ifconfig(address=myAddr, netmask=netmask, mtu=200)
+            elif system == "Darwin":
+                try:
+                    self.tun = DarwinTunDevice()
+                except OSError as ex:  # pylint: disable=broad-except
+                    logger.error(
+                        "Failed to create utun device: %s. If you are on a managed Mac or running security/VPN software, creating utun may be blocked. Try running as an admin user, outside sandboxed shells, and temporarily disable VPN/content filters.",
+                        ex,
+                    )
+                    raise
+                self.tun.up()
+                try:
+                    self.tun.ifconfig(address=myAddr, netmask=netmask, mtu=200)
+                except Exception as ex:  # pylint: disable=broad-except
+                    # Provide actionable guidance on macOS configuration failures
+                    logger.error(
+                        "Failed to configure utun device: %s. Try running with sudo.",
+                        ex,
+                    )
+                    raise
 
         self._rxThread = None
         if self.iface.noProto:
@@ -235,3 +289,132 @@ class Tunnel:
     def close(self):
         """Close"""
         self.tun.close()
+
+
+class DarwinTunDevice:
+    """Minimal utun wrapper for macOS that mimics the TapDevice API we need.
+
+    Reads/writes L3 IPv4 packets. Packets are prefixed with a 4-byte
+    address family header when sent/received.
+    """
+
+    UTUN_CONTROL_NAME = b"com.apple.net.utun_control"
+    CTLIOCGINFO = 0xC0644E03  # _IOWR('N', 3, struct ctl_info)
+    AF_SYS_CONTROL = 2
+    UTUN_OPT_IFNAME = 2
+
+    def __init__(self, name=None) -> None:
+        if platform.system() != "Darwin":
+            raise RuntimeError("DarwinTunDevice is only available on macOS")
+        if fcntl is None or ctypes is None:
+            raise RuntimeError("macOS utun support requires fcntl and ctypes modules")
+
+        # Create a kernel control socket for utun
+        try:
+            self.sock = socket.socket(socket.AF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL)
+        except AttributeError as ex:
+            raise RuntimeError("Python build lacks AF_SYSTEM/SYSPROTO_CONTROL support") from ex
+
+        # Resolve UTUN control id via CTLIOCGINFO ioctl
+        buf = bytearray(struct.pack("I96s", 0, self.UTUN_CONTROL_NAME))
+        fcntl.ioctl(self.sock.fileno(), self.CTLIOCGINFO, buf)
+        ctl_id, _ = struct.unpack("I96s", bytes(buf))
+
+        # Build sockaddr_ctl and connect using libc.connect
+        class SockaddrCtl(ctypes.Structure):
+            _fields_ = [
+                ("sc_len", ctypes.c_ubyte),
+                ("sc_family", ctypes.c_ubyte),
+                ("ss_sysaddr", ctypes.c_uint16),
+                ("sc_id", ctypes.c_uint32),
+                ("sc_unit", ctypes.c_uint32),
+                ("sc_reserved", ctypes.c_uint32 * 5),
+            ]
+
+        sac = SockaddrCtl()
+        sac.sc_len = ctypes.sizeof(SockaddrCtl)
+        sac.sc_family = socket.AF_SYSTEM
+        sac.ss_sysaddr = ctypes.c_uint16(self.AF_SYS_CONTROL)  # type: ignore[assignment]
+        sac.sc_id = ctl_id
+        for i in range(5):
+            sac.sc_reserved[i] = 0
+
+        libc_name = ctypes.util.find_library("c")
+        if not libc_name:
+            raise RuntimeError("Unable to locate libc for utun connect")
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        libc.connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libc.connect.restype = ctypes.c_int
+        # Try kernel-chosen unit first, then a few explicit units
+        attempted_units = [0] + list(range(1, 9))
+        last_err = 0
+        for unit in attempted_units:
+            sac.sc_unit = unit
+            res = libc.connect(
+                self.sock.fileno(), ctypes.byref(sac), ctypes.c_uint32(ctypes.sizeof(SockaddrCtl))
+            )
+            if res == 0:
+                break
+            last_err = ctypes.get_errno()
+        if res != 0:
+            self.sock.close()
+            raise OSError(last_err, "utun connect failed")
+
+        # Query assigned interface name
+        ifname = self.sock.getsockopt(socket.SYSPROTO_CONTROL, self.UTUN_OPT_IFNAME, 128)
+        self.name = ifname.split(b"\x00", 1)[0].decode("utf-8")
+        logger.info("Created utun interface %s", self.name)
+
+    def up(self) -> None:  # Keep API parity
+        pass
+
+    def ifconfig(self, address: str, netmask: str, mtu=None) -> None:
+        # Configure utun as point-to-point (expected on macOS). We set the
+        # same local/peer IP, then add a network route via this interface so
+        # the full mesh subnet (e.g., 10.115/16) is routed through utun.
+        cfg = ["ifconfig", self.name, "inet", address, address, "up"]
+        if mtu:
+            cfg += ["mtu", str(mtu)]
+        subprocess.check_call(cfg)
+
+        # Add a route for the subnet through this utun interface.
+        try:
+            import ipaddress  # lazy import
+
+            net = ipaddress.IPv4Network(f"{address}/{netmask}", strict=False)
+            net_addr = str(net.network_address)
+            mask_str = str(net.netmask)
+            # Delete any pre-existing route and then add.
+            subprocess.call(["route", "-n", "delete", "-net", net_addr, "-netmask", mask_str])
+            subprocess.check_call([
+                "route", "-n", "add", "-net", net_addr, "-netmask", mask_str, "-interface", self.name
+            ])
+        except Exception as ex:  # pylint: disable=broad-except
+            # Routing can still be managed manually if this fails.
+            logger.warning(
+                "Could not add route for %s/%s via %s: %s. You may need: sudo route -n add -net %s -netmask %s -interface %s",
+                address,
+                netmask,
+                self.name,
+                ex,
+                net_addr if 'net_addr' in locals() else '10.115.0.0',
+                mask_str if 'mask_str' in locals() else netmask,
+                self.name,
+            )
+
+    def read(self) -> bytes:
+        data = self.sock.recv(65535)
+        if len(data) < 4:
+            return b""
+        # Strip 4-byte address family header
+        return data[4:]
+
+    def write(self, payload: bytes) -> int:
+        header = struct.pack("!I", socket.AF_INET)
+        return self.sock.send(header + payload)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:  # pragma: no cover
+            pass

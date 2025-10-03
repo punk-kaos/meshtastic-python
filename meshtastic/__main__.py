@@ -1056,7 +1056,7 @@ def onConnected(interface):
         if args.listen:
             closeNow = False
 
-        have_tunnel = platform.system() == "Linux"
+        have_tunnel = platform.system() in ("Linux", "Darwin")
         if have_tunnel and args.tunnel:
             if args.dest != BROADCAST_ADDR:
                 print("A tunnel can only be created using the local node.")
@@ -1434,7 +1434,7 @@ def common():
             # We assume client is fully connected now
             onConnected(client)
 
-            have_tunnel = platform.system() == "Linux"
+            have_tunnel = platform.system() in ("Linux", "Darwin")
             if (
                 args.noproto
                 or args.reply
@@ -2160,7 +2160,7 @@ def initParser():
         "--gpio-watch", help="Start watching a GPIO mask for changes (ex: '0x10')"
     )
 
-    have_tunnel = platform.system() == "Linux"
+    have_tunnel = platform.system() in ("Linux", "Darwin")
     if have_tunnel:
         tunnelArgs = parser.add_argument_group(
             "Tunnel", "Arguments related to establishing a tunnel device over the mesh."
